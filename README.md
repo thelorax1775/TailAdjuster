@@ -14,6 +14,7 @@
 - **Loads the `tun` kernel module on the host** and persists it across reboots — the single most common reason Tailscale silently fails inside containers.
 - **Multi-distro guest support** — installs prerequisites via `apt`, `apk`, `dnf`, or `yum`.
 - **Automatic retry** — if the first join fails (a known `tailscaled` startup race), the guest is rebooted and the join is retried once.
+- **Fails fast on a bad auth key** — if the control server *rejects* the key (invalid, expired, or a single-use key already consumed), the script recognizes it, skips the pointless reboot-and-retry, and stops attempting further enrolls instead of rebooting the rest of your fleet against a dead key.
 - **Resilient scan** — a failure on one guest never aborts the rest of the run.
 - **Full run log** written to `/root/tailscale-bulk-<timestamp>.log`, plus a success/skip/fail summary at the end.
 
@@ -25,7 +26,7 @@
 |-------|-------------|
 | Proxmox host | Run as **root** on a Proxmox VE node (`pvesh`, `pct`, `qm` available). |
 | Proxmox host | `jq` (the script auto-installs it on Debian-based hosts). |
-| You | A valid **Tailscale auth key** (`tskey-auth-…`). [Generate one here.](https://login.tailscale.com/admin/settings/keys) |
+| You | A valid, **reusable** **Tailscale auth key** (`tskey-auth-…`). [Generate one here.](https://login.tailscale.com/admin/settings/keys) A single-use key only enrolls **one** guest — the first one consumes it and every guest after that is rejected. |
 | VMs only | `qemu-guest-agent` must already be **installed and running inside the VM**. See [VMs vs. containers](#vms-vs-containers). |
 
 ---
@@ -95,7 +96,7 @@ Show the built-in help:
    - Ensure `/dev/net/tun` is exposed to the container (edit config + reboot once if it wasn't).
    - Install Tailscale if missing.
    - `tailscale up` with your auth key, enrolling as `ct-<id>`.
-   - On failure: reboot the container and retry once, dumping the last 15 `tailscaled` journal lines if it still fails.
+   - On failure: reboot the container and retry once, dumping the last 15 `tailscaled` journal lines if it still fails — **unless** the failure is an auth-key rejection, in which case it fails fast (no reboot) and stops attempting further enrolls.
 3. **Scan VMs** (`pvesh get /nodes/<node>/qemu`). For each *running* VM with a **responding guest agent**:
    - Same install → join → retry flow, executed inside the guest via the QEMU guest agent, enrolling as `vm-<id>`.
 4. **Summary** — prints `Success / Skipped / Failed` counts and the log path.
@@ -130,6 +131,7 @@ sudo systemctl enable --now qemu-guest-agent
 - **`--reset` is used on join.** Each fresh enroll runs `tailscale up --reset …`, which clears any previous, non-default `tailscale up` settings on that guest. This keeps enrollment deterministic; if you rely on per-guest flags, bake them into `TS_EXTRA_ARGS`.
 - **Auth key visibility.** The key is passed to `tailscale up` inside each guest. Prefer short-lived / reusable keys and rotate them after a bulk run. The key is **not** written to the log file.
 - **Logs.** Every run is teed to `/root/tailscale-bulk-<timestamp>.log`. Failed joins include the last 15 lines of the guest's `tailscaled` journal to speed up diagnosis.
+- **`invalid key … not valid` / one guest joins then the rest fail.** The control server rejected your auth key. The classic tell is a run where the *first* fresh enroll succeeds and every one after it fails with `invalid key`: that's a **single-use key** — the first guest consumed it. Generate a **reusable, pre-authorized** key ([keys page](https://login.tailscale.com/admin/settings/keys)) and re-run; already-joined guests are skipped, so only the stragglers are enrolled. Expired keys and disallowed `--advertise-tags` produce the same fail-fast path. (Note: the short ID in the error, e.g. `kGqPFaeTiV11CNTRL`, is Tailscale's internal handle for the key, **not** your secret.)
 - **Nothing happens / everything skipped.** That's the expected result on a second run — every guest is already in the tailnet. 🎉
 
 ---
