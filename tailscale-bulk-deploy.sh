@@ -63,6 +63,12 @@ SUCCESS=0
 FAILED=0
 SKIPPED=0
 
+# Set to 1 the moment the control server rejects our auth key. Once that
+# happens no other guest can possibly enroll with the same key, so the rest
+# of the run stops attempting fresh joins instead of needlessly rebooting
+# every remaining guest to retry against a key we already know is dead.
+AUTH_KEY_BAD=0
+
 exec > >(tee -a "$LOG") 2>&1
 
 # shellcheck disable=SC2154  # $s is assigned within the trap body itself
@@ -120,6 +126,16 @@ fi
 inc() {
     local -n _v="$1"
     _v=$(( _v + 1 ))
+}
+
+# Detects whether a failed `tailscale up` failed specifically because the
+# control server rejected the auth key (invalid, expired, or a single-use
+# key that a previous guest already consumed). These are NOT fixable by
+# rebooting and retrying — every subsequent guest will hit the same wall —
+# so callers use this to fail fast and short-circuit the rest of the run.
+is_authkey_error() {
+    printf '%s' "$1" | grep -qiE \
+        'invalid key|not valid|key.*expired|expired.*key|already been used|is invalid|authkey|requested tags'
 }
 
 # ---------------------------------------------------------------------------
@@ -220,19 +236,30 @@ join_tailnet_lxc() {
 
     echo "[*] Joining tailnet (fresh enroll) as '$hostname'"
 
-    if pct exec "$ct" -- bash -c "
-        set -e
+    # Capture combined output (still echoed below) so we can tell an auth-key
+    # rejection apart from the racey tailscaled-startup failure. Return code 2
+    # signals "auth key rejected — retrying/rebooting is pointless".
+    local out
+    if out=$(pct exec "$ct" -- bash -c "
         tailscale up --reset --authkey '$AUTH_KEY' --hostname '$hostname' $EXTRA_ARGS
-    "; then
+    " 2>&1); then
+        [[ -n "$out" ]] && printf '%s\n' "$out"
         echo "[+] Joined tailnet"
         return 0
-    else
-        echo "[X] Tailnet join failed"
-        echo "    --- tailscaled journal (last 15 lines) ---"
-        pct exec "$ct" -- journalctl -u tailscaled -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
-        echo "    -------------------------------------------"
-        return 1
     fi
+
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+
+    if is_authkey_error "$out"; then
+        echo "[X] Tailnet join failed — control server rejected the auth key"
+        return 2
+    fi
+
+    echo "[X] Tailnet join failed"
+    echo "    --- tailscaled journal (last 15 lines) ---"
+    pct exec "$ct" -- journalctl -u tailscaled -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || true
+    echo "    -------------------------------------------"
+    return 1
 }
 
 process_lxc() {
@@ -245,6 +272,15 @@ process_lxc() {
     if is_lxc_tailscale_active "$ct"; then
         echo "[SKIP] Tailscale already active in tailnet"
         inc SKIPPED
+        return
+    fi
+
+    # If a previous guest already proved the auth key is dead, don't bother
+    # installing/rebooting this one just to hit the same rejection.
+    if [[ "$AUTH_KEY_BAD" -eq 1 ]]; then
+        echo "[X] Skipping enroll — auth key was already rejected earlier this run."
+        echo "    Supply a valid, reusable TS_AUTHKEY and re-run."
+        inc FAILED
         return
     fi
 
@@ -274,8 +310,24 @@ process_lxc() {
         sleep 5
     fi
 
-    if join_tailnet_lxc "$ct"; then
+    local jrc=0
+    join_tailnet_lxc "$ct" || jrc=$?
+    if [[ $jrc -eq 0 ]]; then
         inc SUCCESS
+        echo
+        return
+    fi
+
+    # Return 2 means the control server rejected the auth key. A reboot can
+    # never fix that, and every remaining guest would fail identically, so
+    # flag the key as dead and bail out of this guest without rebooting it.
+    if [[ $jrc -eq 2 ]]; then
+        AUTH_KEY_BAD=1
+        echo "[X] Auth key rejected — the key is invalid, expired, or single-use"
+        echo "    and already consumed by an earlier guest. Not rebooting CT $ct."
+        echo "    Generate a fresh REUSABLE key and re-run:"
+        echo "    https://login.tailscale.com/admin/settings/keys"
+        inc FAILED
         echo
         return
     fi
@@ -298,10 +350,13 @@ process_lxc() {
     fi
     sleep 5   # give tailscaled a moment to fully start after boot
 
-    if join_tailnet_lxc "$ct"; then
+    jrc=0
+    join_tailnet_lxc "$ct" || jrc=$?
+    if [[ $jrc -eq 0 ]]; then
         echo "[+] Joined tailnet after reboot"
         inc SUCCESS
     else
+        [[ $jrc -eq 2 ]] && AUTH_KEY_BAD=1
         echo "[X] Still failed after reboot — needs manual investigation"
         inc FAILED
     fi
@@ -390,16 +445,31 @@ join_tailnet_vm() {
 
     echo "[*] Joining tailnet (fresh enroll) as '$hostname'"
 
-    if vm_guest_exec "$vmid" "tailscale up --reset --authkey '$AUTH_KEY' --hostname '$hostname' $EXTRA_ARGS"; then
+    # Capture the guest's stdout so we can distinguish an auth-key rejection
+    # (return 2, not fixable by a reboot) from the racey startup failure.
+    # `2>&1` folds tailscaled's error into the guest's stdout (out-data),
+    # which is the only stream vm_guest_exec surfaces — without it an auth-key
+    # rejection message would be invisible to is_authkey_error below.
+    local out
+    if out=$(vm_guest_exec "$vmid" \
+        "tailscale up --reset --authkey '$AUTH_KEY' --hostname '$hostname' $EXTRA_ARGS 2>&1" print); then
+        [[ -n "$out" ]] && printf '%s\n' "$out"
         echo "[+] Joined tailnet"
         return 0
-    else
-        echo "[X] Tailnet join failed"
-        echo "    --- tailscaled journal (last 15 lines) ---"
-        vm_guest_exec "$vmid" 'journalctl -u tailscaled -n 15 --no-pager' print | sed 's/^/    /' || true
-        echo "    -------------------------------------------"
-        return 1
     fi
+
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+
+    if is_authkey_error "$out"; then
+        echo "[X] Tailnet join failed — control server rejected the auth key"
+        return 2
+    fi
+
+    echo "[X] Tailnet join failed"
+    echo "    --- tailscaled journal (last 15 lines) ---"
+    vm_guest_exec "$vmid" 'journalctl -u tailscaled -n 15 --no-pager' print | sed 's/^/    /' || true
+    echo "    -------------------------------------------"
+    return 1
 }
 
 process_vm() {
@@ -423,14 +493,37 @@ process_vm() {
         return
     fi
 
+    # Don't reinstall/reboot a VM to chase an auth key already proven dead.
+    if [[ "$AUTH_KEY_BAD" -eq 1 ]]; then
+        echo "[X] Skipping enroll — auth key was already rejected earlier this run."
+        echo "    Supply a valid, reusable TS_AUTHKEY and re-run."
+        inc FAILED
+        return
+    fi
+
     if ! install_tailscale_vm "$vmid"; then
         echo "[X] Install failed"
         inc FAILED
         return
     fi
 
-    if join_tailnet_vm "$vmid"; then
+    local jrc=0
+    join_tailnet_vm "$vmid" || jrc=$?
+    if [[ $jrc -eq 0 ]]; then
         inc SUCCESS
+        echo
+        return
+    fi
+
+    # Return 2 == control server rejected the auth key: unfixable by reboot,
+    # and fatal for every remaining guest. Flag it and stop without rebooting.
+    if [[ $jrc -eq 2 ]]; then
+        AUTH_KEY_BAD=1
+        echo "[X] Auth key rejected — the key is invalid, expired, or single-use"
+        echo "    and already consumed by an earlier guest. Not rebooting VM $vmid."
+        echo "    Generate a fresh REUSABLE key and re-run:"
+        echo "    https://login.tailscale.com/admin/settings/keys"
+        inc FAILED
         echo
         return
     fi
@@ -452,10 +545,13 @@ process_vm() {
     fi
     sleep 5   # give tailscaled a moment to fully start after boot
 
-    if join_tailnet_vm "$vmid"; then
+    jrc=0
+    join_tailnet_vm "$vmid" || jrc=$?
+    if [[ $jrc -eq 0 ]]; then
         echo "[+] Joined tailnet after reboot"
         inc SUCCESS
     else
+        [[ $jrc -eq 2 ]] && AUTH_KEY_BAD=1
         echo "[X] Still failed after reboot — needs manual investigation"
         inc FAILED
     fi
@@ -498,3 +594,13 @@ echo "Success : $SUCCESS"
 echo "Skipped : $SKIPPED"
 echo "Failed  : $FAILED"
 echo "Log     : $LOG"
+
+if [[ "$AUTH_KEY_BAD" -eq 1 ]]; then
+    echo
+    echo "[!] The control server rejected your auth key partway through this run."
+    echo "    Guests that still needed enrolling were left unjoined. The usual"
+    echo "    cause is a SINGLE-USE key: the first guest consumes it and every"
+    echo "    later guest is rejected. Generate a REUSABLE, pre-authorized key"
+    echo "    and re-run — already-joined guests will simply be skipped."
+    echo "    https://login.tailscale.com/admin/settings/keys"
+fi
